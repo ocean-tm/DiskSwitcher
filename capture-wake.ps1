@@ -1,4 +1,4 @@
-param([ValidateRange(30, 1800)][int]$DurationSeconds = 1200)
+param([ValidateRange(30, 14400)][int]$DurationSeconds = 3600)
 $ErrorActionPreference = 'Stop'
 $traceDirectory = Join-Path $PSScriptRoot 'diagnostics'
 New-Item -ItemType Directory -Path $traceDirectory -Force | Out-Null

@@ -1,0 +1,20 @@
+# Build output
+/build/
+/*.exe
+*.o
+*.obj
+*.res
+*.pdb
+*.ilk
+
+# Diagnostic captures
+/diagnostics/
+*.etl
+
+# Editor and OS files
+.vs/
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db

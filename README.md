@@ -11,6 +11,8 @@ Disk Switcher is a small native Windows utility for managing physical disks. It 
 - Blocks Offline and standby operations for the disk containing the running Windows installation.
 - Locks and flushes every volume on an Online disk before taking it Offline. The operation stops if a volume is busy or cannot be identified.
 - Remembers the last accepted standby request without reopening that physical disk on the next application launch.
+- **Stop HDD + block system wakeups** sends standby and then disables that disk's PnP device, preventing WMI, Windows Update and other software from reopening it.
+- Keeps a disabled disk visible in the application and re-enables the device when **Bring Online** is pressed.
 - Prevents multiple application instances from querying the disks independently.
 
 The application requires administrator privileges because Windows restricts raw disk access and disk attribute changes.
@@ -21,7 +23,9 @@ The application requires administrator privileges because Windows restricts raw 
 - MinGW-w64 GCC for building from source
 - SATA, ATA, SCSI and RAID disk interfaces may be attempted, but standby command support depends on the drive, controller and driver
 
-Disk Switcher changes the Windows Online/Offline state and requests a drive power state. It does not physically disconnect SATA power. Another application, Windows component or storage driver can wake a sleeping HDD. An accepted command confirms only that the driver and disk accepted the request; the program cannot measure spindle rotation.
+Disk Switcher changes the Windows Online/Offline state and requests a drive power state. It does not physically disconnect SATA power. Standby alone can be interrupted by Windows components that open the raw physical disk. Deep sleep therefore disables the selected PnP disk device only after the standby command is accepted. While disabled, the disk is unavailable to all software until **Bring Online** re-enables it. The running Windows disk is excluded by the safety checks.
+
+Diagnostics on the original machine showed this wake chain: `MoUsoCoreWorker.exe` started Windows Update Medic, Medic restored `wuauserv`, and its WMI inventory opened `\Device\Harddisk1\DR1`. Disabling only Windows Update was ineffective because Medic restored it automatically; disabling the target disk device blocks the raw open at its source.
 
 ## Usage
 
@@ -30,7 +34,7 @@ Disk Switcher changes the Windows Online/Offline state and requests a drive powe
 3. Use one of the available actions:
    - **Bring Online** — makes an Offline disk accessible again.
    - **Take Offline** — flushes and locks its volumes, then takes the disk Offline.
-   - **Stop / repeat HDD standby** — takes the disk Offline if necessary and requests HDD standby.
+   - **Stop HDD + block system wakeups** — takes the disk Offline, requests HDD standby, then disables its PnP device.
    - **Refresh** — rereads the disk list. A disk remembered as sleeping is kept in the list without opening it.
 
 Close applications and files that use the selected disk before taking it Offline. A physically disconnected disk cannot be brought Online by software.
@@ -75,7 +79,7 @@ gcc main.c power.c build\app.res -o DiskSwitcher.exe `
   '-Wl,--nxcompat' '-Wl,--dynamicbase'
 ```
 
-`app.manifest` is embedded by `windres` and makes the executable request administrator privileges. The current executable version is `1.2.0`.
+`app.manifest` is embedded by `windres` and makes the executable request administrator privileges. The current executable version is `1.4.0`.
 
 ## Verification
 
@@ -122,7 +126,7 @@ The trace is saved under `diagnostics\` and is ignored by Git.
 
 - `main.c` contains disk enumeration, Windows disk protection, volume locking and the Win32 user interface.
 - `power.c` and `power.h` contain ATA and SCSI standby commands.
-- The last accepted standby request is cached in the volatile registry key `HKCU\Software\DiskSwitcher\StandbySession`. **Bring Online** clears it after a confirmed reconnect.
+- The last accepted standby request and disabled-device state are cached in the volatile registry key `HKCU\Software\DiskSwitcher\StandbySession`. **Bring Online** re-enables the device and clears the cache after a confirmed reconnect.
 - The running Windows volume is resolved to all of its physical disk extents. If this safety check fails, destructive state changes are blocked.
 
 Relevant Microsoft documentation:

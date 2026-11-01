@@ -42,6 +42,10 @@ int wmain(void) {
         if (!IsWindowEnabled(onlineButton) || IsWindowEnabled(offlineButton) ||
             !IsWindowEnabled(sleepButton)) return 6;
         puts("PASS: cached standby UI permits reconnect and manual sleep retry");
+        savedStandby.deviceDisabled = TRUE;
+        selectionChanged();
+        if (!IsWindowEnabled(onlineButton) || IsWindowEnabled(sleepButton)) return 7;
+        puts("PASS: disabled-device cache remains reconnectable without another disk query");
     }
     DestroyWindow(hwnd);
     return 0;

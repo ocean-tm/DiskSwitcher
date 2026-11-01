@@ -1,5 +1,6 @@
 /* Uses an isolated registry key; never opens or changes a real disk. */
 #define STANDBY_CACHE_KEY L"Software\\DiskSwitcher\\TestStandbyCache"
+#define UPDATE_GUARD_CACHE_KEY L"Software\\DiskSwitcherTestUpdateGuardCache"
 #include "../main.c"
 #include <assert.h>
 #undef assert
@@ -15,7 +16,7 @@ int wmain(void) {
     wcscpy(sample.instanceId, L"test-instance-id");
     wcscpy(sample.title, L"Disk 1 [F:] - test HDD");
     wcscpy(standbyReport, L"ATA: accepted");
-    assert(saveStandbyCache(&sample));
+    assert(saveStandbyCache(&sample, TRUE));
     ZeroMemory(&savedStandby, sizeof(savedStandby));
     standbyPath[0] = standbyReport[0] = 0;
     savedStandbyValid = FALSE;
@@ -24,7 +25,8 @@ int wmain(void) {
     assert(wcscmp(standbyPath, sample.path) == 0);
     assert(wcscmp(savedStandby.disk.instanceId, sample.instanceId) == 0);
     assert(wcscmp(standbyReport, L"ATA: accepted") == 0);
-    puts("PASS: standby identity and command result survive a fresh process state");
+    assert(savedStandby.deviceDisabled == TRUE);
+    puts("PASS: standby identity, command result and disabled-device state survive a fresh process state");
     StandbyCache invalid = savedStandby;
     invalid.version = 99;
     assert(!validStandbyCache(&invalid));

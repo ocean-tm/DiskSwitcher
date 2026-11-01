@@ -46,16 +46,23 @@ static HFONT font;
 #ifndef STANDBY_CACHE_KEY
 #define STANDBY_CACHE_KEY L"Software\\DiskSwitcher\\StandbySession"
 #endif
+#ifndef UPDATE_GUARD_CACHE_KEY
+#define UPDATE_GUARD_CACHE_KEY L"Software\\DiskSwitcherUpdateGuard"
+#endif
 typedef struct {
     DWORD version;
     Disk disk;
     WCHAR report[512];
+    DWORD deviceDisabled;
 } StandbyCache;
 static StandbyCache savedStandby;
 static BOOL savedStandbyValid;
 
+#define UPDATE_GUARD_VALUE L"OriginalServiceState"
+
 static BOOL validStandbyCache(const StandbyCache *cache) {
-    return cache->version == 1 && cache->disk.path[0] && cache->disk.instanceId[0] &&
+    return cache->version == 2 && cache->deviceDisabled <= 1 &&
+        cache->disk.path[0] && cache->disk.instanceId[0] &&
         wmemchr(cache->disk.path, 0, 1024) && wmemchr(cache->disk.instanceId, 0, 512) &&
         wmemchr(cache->disk.title, 0, 384) && wmemchr(cache->report, 0, 512);
 }
@@ -77,20 +84,85 @@ static BOOL loadStandbyCache(void) {
     return TRUE;
 }
 
-static BOOL saveStandbyCache(const Disk *disk) {
-    savedStandby.version = 1;
+static BOOL saveStandbyCache(const Disk *disk, BOOL deviceDisabled) {
+    savedStandby.version = 2;
     savedStandby.disk = *disk;
     wcscpy(savedStandby.report, standbyReport);
+    savedStandby.deviceDisabled = deviceDisabled ? 1 : 0;
     savedStandbyValid = TRUE;
     HKEY key;
     /* Volatile: no cache file on a potentially sleeping HDD, and no stale
        state retained after the user hive is unloaded. */
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, STANDBY_CACHE_KEY, 0, NULL, REG_OPTION_VOLATILE,
-                        KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return FALSE;
+    LONG opened = RegCreateKeyExW(HKEY_CURRENT_USER, STANDBY_CACHE_KEY, 0, NULL,
+                                  REG_OPTION_VOLATILE, KEY_SET_VALUE, NULL, &key, NULL);
+    if (opened != ERROR_SUCCESS) { SetLastError(opened); return FALSE; }
     LONG result = RegSetValueExW(key, L"LastAcceptedStop", 0, REG_BINARY,
                                (const BYTE *)&savedStandby, sizeof(savedStandby));
     RegCloseKey(key);
+    if (result != ERROR_SUCCESS) SetLastError(result);
     return result == ERROR_SUCCESS;
+}
+
+typedef struct { DWORD version, startType, wasRunning; } LegacyUpdateGuard;
+
+/* v1.3 migration: restore Windows Update once, then remove its old guard. */
+static void restoreLegacyUpdateGuard(void) {
+    HKEY key;
+    LegacyUpdateGuard old = {0};
+    DWORD bytes = sizeof(old), type;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, UPDATE_GUARD_CACHE_KEY, 0,
+                      KEY_QUERY_VALUE | KEY_SET_VALUE, &key) != ERROR_SUCCESS) return;
+    LONG result = RegQueryValueExW(key, UPDATE_GUARD_VALUE, NULL, &type, (BYTE *)&old, &bytes);
+    BOOL restored = FALSE;
+    if (result == ERROR_SUCCESS && type == REG_BINARY && bytes == sizeof(old) && old.version == 1 &&
+        (old.startType == SERVICE_AUTO_START || old.startType == SERVICE_DEMAND_START) && old.wasRunning <= 1) {
+        SC_HANDLE manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+        SC_HANDLE service = manager ? OpenServiceW(manager, L"wuauserv",
+            SERVICE_CHANGE_CONFIG | SERVICE_START) : NULL;
+        if (service && ChangeServiceConfigW(service, SERVICE_NO_CHANGE, old.startType,
+                SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
+            if (old.wasRunning) StartServiceW(service, 0, NULL);
+            RegDeleteValueW(key, UPDATE_GUARD_VALUE);
+            restored = TRUE;
+        }
+        if (service) CloseServiceHandle(service);
+        if (manager) CloseServiceHandle(manager);
+    }
+    RegCloseKey(key);
+    if (restored) RegDeleteKeyW(HKEY_CURRENT_USER, UPDATE_GUARD_CACHE_KEY);
+}
+
+static BOOL setDeviceEnabled(const WCHAR *instanceId, BOOL enabled) {
+    HDEVINFO info = SetupDiCreateDeviceInfoList(NULL, NULL);
+    if (info == INVALID_HANDLE_VALUE) return FALSE;
+    SP_DEVINFO_DATA device = {0};
+    device.cbSize = sizeof(device);
+    BOOL ok = SetupDiOpenDeviceInfoW(info, instanceId, NULL, 0, &device);
+    if (ok) {
+        SP_PROPCHANGE_PARAMS change = {0};
+        change.ClassInstallHeader.cbSize = sizeof(change.ClassInstallHeader);
+        change.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+        change.StateChange = enabled ? DICS_ENABLE : DICS_DISABLE;
+        change.Scope = DICS_FLAG_GLOBAL;
+        change.HwProfile = 0;
+        ok = SetupDiSetClassInstallParamsW(info, &device,
+            &change.ClassInstallHeader, sizeof(change)) &&
+            SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, info, &device);
+    }
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    SetupDiDestroyDeviceInfoList(info);
+    SetLastError(error);
+    return ok;
+}
+
+static HANDLE openDiskWithRetry(const WCHAR *path, DWORD access) {
+    for (int i = 0; i < 40; ++i) {
+        HANDLE h = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) return h;
+        Sleep(250);
+    }
+    return INVALID_HANDLE_VALUE;
 }
 
 static void clearStandbyCache(void) {
@@ -226,11 +298,12 @@ static void selectionChanged(void) {
         return;
     }
     if (standbyPath[0] && wcscmp(standbyPath, disks[index].path) == 0) {
-        WCHAR text[768];
-        swprintf(text, 768, L"Last request: Offline + standby. Live status is not queried.\r\n%ls\r\nUse Bring Online to reconnect, or repeat standby below.", standbyReport);
+        WCHAR text[900];
+        swprintf(text, 900, L"Last request: Offline + standby. Live status is not queried.\r\n%ls\r\nWakeup block: %ls. Use Bring Online to reconnect.", standbyReport,
+                 savedStandby.deviceDisabled ? L"ACTIVE (PnP device disabled)" : L"not active");
         SetWindowTextW(statusText, text);
         EnableWindow(onlineButton, TRUE);
-        EnableWindow(sleepButton, TRUE);
+        EnableWindow(sleepButton, !savedStandby.deviceDisabled);
         return;
     }
     HANDLE h = CreateFileW(disks[index].path, GENERIC_READ,
@@ -277,6 +350,7 @@ static void refreshDisks(void) {
     SP_DEVICE_INTERFACE_DATA iface = {0};
     iface.cbSize = sizeof(iface);
     int restore = 0;
+    BOOL sleepingAdded = FALSE;
     for (DWORD i = 0; diskCount < 256 &&
          SetupDiEnumDeviceInterfaces(info, NULL, &diskGuid, i, &iface); ++i) {
         DWORD needed = 0, bytes;
@@ -293,6 +367,7 @@ static void refreshDisks(void) {
                 SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)sleeping.title);
                 if (sleeping.number == previous) restore = diskCount;
                 ++diskCount;
+                sleepingAdded = TRUE;
                 HeapFree(GetProcessHeap(), 0, detail);
                 continue; /* Preserve the entry without opening or querying this disk. */
             }
@@ -327,6 +402,12 @@ static void refreshDisks(void) {
         }
         HeapFree(GetProcessHeap(), 0, detail);
     }
+    if (keepSleeping && !sleepingAdded && diskCount < 256) {
+        disks[diskCount] = sleeping;
+        SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)sleeping.title);
+        if (sleeping.number == previous) restore = diskCount;
+        ++diskCount;
+    }
     SetupDiDestroyDeviceInfoList(info);
     if (diskCount) SendMessageW(combo, CB_SETCURSEL, restore, 0);
     selectionChanged();
@@ -343,8 +424,14 @@ static void changeDisk(HWND owner, BOOL offline, BOOL standby) {
         if (MessageBoxW(owner, question, L"Take disk Offline",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return;
     }
-    HANDLE h = CreateFileW(disk.path, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (!offline && savedStandbyValid && savedStandby.deviceDisabled &&
+        wcscmp(standbyPath, disk.path) == 0) {
+        if (!setDeviceEnabled(disk.instanceId, TRUE)) {
+            showError(owner, L"Could not re-enable the disk device.", GetLastError());
+            return;
+        }
+    }
+    HANDLE h = openDiskWithRetry(disk.path, GENERIC_READ | GENERIC_WRITE);
     if (h == INVALID_HANDLE_VALUE) {
         showError(owner, L"Could not open the disk.", GetLastError());
         refreshDisks(); return;
@@ -406,11 +493,21 @@ static void changeDisk(HWND owner, BOOL offline, BOOL standby) {
     CloseHandle(h);
     if (!offline && verified && wcscmp(standbyPath, disk.path) == 0) clearStandbyCache();
     if (slept) {
+        BOOL disabled = setDeviceEnabled(disk.instanceId, FALSE);
+        DWORD disableError = disabled ? ERROR_SUCCESS : GetLastError();
+        if (disabled) {
+            wcsncat(standbyReport, L"\r\nPnP device disabled: system wakeups are blocked.",
+                    511 - wcslen(standbyReport));
+        } else {
+            wcsncat(standbyReport, L"\r\nPnP disable failed: the HDD may still be woken.",
+                    511 - wcslen(standbyReport));
+        }
         wcscpy(standbyPath, disk.path);
-        BOOL saved = saveStandbyCache(&disk);
+        BOOL saved = saveStandbyCache(&disk, disabled);
         selectionChanged();
         if (!saved) MessageBoxW(owner, L"The stop command was accepted, but its cached state could not be saved. Keep this window open to avoid a fresh disk query at next launch.",
                                L"Disk Switcher", MB_OK | MB_ICONWARNING);
+        if (!disabled) showError(owner, L"The HDD stop command was accepted, but Windows did not disable its PnP device.", disableError);
         return; /* Do not follow the standby command with disk queries. */
     }
     if (standby && verified) {
@@ -435,6 +532,7 @@ static HWND control(HWND owner, const WCHAR *cls, const WCHAR *text, DWORD style
 static LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
+        restoreLegacyUpdateGuard();
         loadStandbyCache();
         font = CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
@@ -445,10 +543,11 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         onlineButton = control(hwnd, L"BUTTON", L"Bring Online", WS_TABSTOP, 22, 202, 170, 38, 102);
         offlineButton = control(hwnd, L"BUTTON", L"Take Offline", WS_TABSTOP, 210, 202, 170, 38, 103);
         control(hwnd, L"BUTTON", L"Refresh", WS_TABSTOP, 398, 202, 180, 38, 104);
-        sleepButton = control(hwnd, L"BUTTON", L"Stop / repeat HDD standby", WS_TABSTOP,
+        sleepButton = control(hwnd, L"BUTTON", L"Stop HDD + block system wakeups", WS_TABSTOP,
                               22, 252, 556, 38, 105);
-        control(hwnd, L"STATIC", L"Offline persists across restarts.\r\nOther applications and drivers may wake the HDD.",
-                0, 22, 306, 556, 50, 0);
+        control(hwnd, L"STATIC",
+            L"Deep sleep disables the selected PnP disk device after ATA standby.\r\nThe disk stays in this list; Bring Online re-enables it.",
+            0, 22, 304, 556, 55, 0);
         refreshDisks();
         return 0;
     case WM_COMMAND:
@@ -478,12 +577,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command, int s
     WNDCLASSW cls = {0};
     cls.lpfnWndProc = windowProc;
     cls.hInstance = instance;
-    cls.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    cls.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    cls.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
+    cls.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
     cls.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     cls.lpszClassName = L"DiskSwitcherWindow";
     if (!RegisterClassW(&cls)) return 1;
-    RECT rect = {0, 0, 600, 372};
+    RECT rect = {0, 0, 600, 402};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&rect, style, FALSE);
     HWND hwnd = CreateWindowW(cls.lpszClassName, L"Disk Switcher", style,
